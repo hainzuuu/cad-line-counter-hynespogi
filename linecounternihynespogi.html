@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Clean Precision CAD Rebar Counter</title>
+  <style>
+    :root {
+      --bg: #121214;
+      --panel: #1e1e24;
+      --border: #33333d;
+      --accent: #2563eb;
+      --text: #e4e4e7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: monospace;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    .top-bar {
+      display: flex;
+      gap: 12px;
+      padding: 10px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .control {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+    }
+    input, button, select {
+      background: #09090b;
+      color: #fff;
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    button {
+      background: var(--accent);
+      cursor: pointer;
+      font-weight: bold;
+      border: none;
+    }
+    button:hover { opacity: 0.9; }
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 280px;
+      flex: 1;
+      height: calc(100vh - 55px);
+      overflow: hidden;
+    }
+    .viewport {
+      position: relative;
+      overflow: auto;
+      background: #000;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+    }
+    canvas { display: block; }
+    .sidebar {
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 12px;
+      overflow-y: auto;
+    }
+    .total { font-size: 16px; font-weight: bold; color: #10b981; }
+    .hint { font-size: 11px; color: #a1a1aa; line-height: 1.4; margin-top: auto;}
+  </style>
+</head>
+<body>
+
+  <div class="top-bar">
+    <input type="file" id="fileInput" accept="image/*" />
+
+    <button id="rotateBtn" type="button">↻ Rotate 90°</button>
+
+    <div class="control">
+      <label>Mode:</label>
+      <select id="countMode">
+        <option value="auto" selected>Auto-Segment Bays</option>
+        <option value="manual">Manual Box Selection (Drag)</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Color Scheme:</label>
+      <select id="bgMode">
+        <option value="darkLines" selected>Dark Lines on Light BG</option>
+        <option value="lightLines">Light/White Lines on Dark BG</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Darkness Filter:</label>
+      <input type="range" id="darkThresh" min="10" max="250" value="180" />
+      <span id="threshVal">180</span>
+    </div>
+
+    <div class="control">
+      <label>Min Line Spacing (px):</label>
+      <input type="number" id="minGap" min="1" max="40" value="3" style="width: 50px;" />
+    </div>
+
+    <div class="control">
+      <label><input type="checkbox" id="showMask" /> View Binary Mask</label>
+    </div>
+
+    <button id="runBtn">Recalculate</button>
+  </div>
+
+  <div class="layout">
+    <div class="viewport" id="vp">
+      <canvas id="cv"></canvas>
+    </div>
+
+    <div class="sidebar">
+      <div>
+        <div style="font-weight: bold; margin-bottom: 6px;">Results Summary</div>
+        <div class="total" id="totalCount">Total: 0 lines (0 sections)</div>
+      </div>
+      
+      <div id="sectionCounts"></div>
+
+      <div class="hint">
+        <strong>Tuning Guide:</strong><br/>
+        - <strong>Min Line Spacing:</strong> Increase if blurry edges or faint halos create double counts on single lines.<br/>
+        - <strong>Darkness Filter:</strong> Lower to ignore faint artifacts completely; raise to pick up low-contrast rebar.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const rotateBtn = document.getElementById('rotateBtn');
+    const canvas = document.getElementById('cv');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const runBtn = document.getElementById('runBtn');
+    const bgMode = document.getElementById('bgMode');
+    const darkThresh = document.getElementById('darkThresh');
+    const threshVal = document.getElementById('threshVal');
+    const minGapInput = document.getElementById('minGap');
+    const showMask = document.getElementById('showMask');
+    const countMode = document.getElementById('countMode');
+    const totalCount = document.getElementById('totalCount');
+    const sectionCountsDisplay = document.getElementById('sectionCounts');
+
+    let rawImg = null;
+    let rotationAngle = 0;
+    let dragStart = null;
+    let manualRect = null;
+    let sections = [];
+
+    darkThresh.oninput = () => { threshVal.textContent = darkThresh.value; };
+
+    fileInput.onchange = (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          rawImg = img;
+          rotationAngle = 0;
+          manualRect = null;
+          updateCanvasSize();
+          runPipeline();
+        };
+        img.src = ev.target.result;
+      };
+      r.readAsDataURL(f);
+    };
+
+    rotateBtn.onclick = () => {
+      if (!rawImg) return;
+      rotationAngle = (rotationAngle + 90) % 360;
+      manualRect = null;
+      updateCanvasSize();
+      runPipeline();
+    };
+
+    function updateCanvasSize() {
+      if (!rawImg) return;
+      const isPerpendicular = rotationAngle === 90 || rotationAngle === 270;
+      canvas.width = isPerpendicular ? rawImg.naturalHeight : rawImg.naturalWidth;
+      canvas.height = isPerpendicular ? rawImg.naturalWidth : rawImg.naturalHeight;
+    }
+
+    canvas.onmousedown = (e) => {
+      if (countMode.value !== 'manual' || !rawImg) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width;
+      const sy = canvas.height / rect.height;
+      dragStart = { x: (e.clientX - rect.left) * sx, y: (e.clientY - rect.top) * sy };
+    };
+
+    canvas.onmouseup = (e) => {
+      if (!dragStart) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width;
+      const sy = canvas.height / rect.height;
+      const curX = (e.clientX - rect.left) * sx;
+      const curY = (e.clientY - rect.top) * sy;
+
+      manualRect = {
+        x: Math.min(dragStart.x, curX),
+        y: Math.min(dragStart.y, curY),
+        w: Math.abs(curX - dragStart.x),
+        h: Math.abs(curY - dragStart.y)
+      };
+      dragStart = null;
+      if (manualRect.w > 4 && manualRect.h > 4) {
+        runPipeline();
+      }
+    };
+
+    runBtn.onclick = () => runPipeline();
+    bgMode.onchange = () => runPipeline();
+    showMask.onchange = () => runPipeline();
+    countMode.onchange = () => runPipeline();
+    minGapInput.onchange = () => runPipeline();
+
+    function drawRotatedSource() {
+      ctx.save();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate((rotationAngle * Math.PI) / 180);
+      ctx.drawImage(rawImg, -rawImg.naturalWidth / 2, -rawImg.naturalHeight / 2);
+      ctx.restore();
+    }
+
+    // 3-point Gaussian smoothing on 1D density array to filter blur ridges
+    function smoothProfile(arr) {
+      const smoothed = new Float32Array(arr.length);
+      for (let i = 0; i < arr.length; i++) {
+        const p0 = i > 0 ? arr[i - 1] : arr[i];
+        const p1 = arr[i];
+        const p2 = i < arr.length - 1 ? arr[i + 1] : arr[i];
+        smoothed[i] = 0.25 * p0 + 0.5 * p1 + 0.25 * p2;
+      }
+      return smoothed;
+    }
+
+    function runPipeline() {
+      if (!rawImg) return;
+
+      const w = canvas.width;
+      const h = canvas.height;
+
+      drawRotatedSource();
+
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const data = imgData.data;
+
+      const threshold = parseInt(darkThresh.value, 10);
+      const minGap = Math.max(1, parseInt(minGapInput.value, 10) || 3);
+      const isLightOnDark = bgMode.value === 'lightLines';
+      const mask = new Uint8Array(w * h);
+
+      for (let i = 0; i < data.length; i += 4) {
+        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+        const isTarget = isLightOnDark ? lum > threshold : lum < threshold;
+        if (isTarget) { mask[i / 4] = 1; }
+      }
+
+      if (showMask.checked) {
+        const maskImg = ctx.createImageData(w, h);
+        for (let i = 0; i < mask.length; i++) {
+          const val = mask[i] ? 255 : 0;
+          maskImg.data[i*4] = val;
+          maskImg.data[i*4+1] = val;
+          maskImg.data[i*4+2] = val;
+          maskImg.data[i*4+3] = 255;
+        }
+        ctx.putImageData(maskImg, 0, 0);
+      }
+
+      sections = [];
+      if (countMode.value === 'manual' && manualRect) {
+        sections.push(manualRect);
+      } else {
+        const xProfile = new Int32Array(w);
+        for (let y = 0; y < h; y++) {
+          const ro = y * w;
+          for (let x = 0; x < w; x++) {
+            if (mask[ro + x]) xProfile[x]++;
+          }
+        }
+
+        const colThreshold = Math.max(6, Math.floor(h * 0.02));
+        let inSec = false;
+        let startX = 0;
+
+        for (let x = 0; x < w; x++) {
+          if (xProfile[x] >= colThreshold && !inSec) {
+            inSec = true;
+            startX = x;
+          } else if (xProfile[x] < colThreshold && inSec) {
+            if (x - startX >= 4) {
+              sections.push({ x: startX, y: 0, w: x - startX, h: h });
+            }
+            inSec = false;
+          }
+        }
+        if (inSec && (w - startX >= 4)) {
+          sections.push({ x: startX, y: 0, w: w - startX, h: h });
+        }
+      }
+
+      let grandTotal = 0;
+      sectionCountsDisplay.innerHTML = '';
+
+      sections.forEach((sec, idx) => {
+        const secX = Math.floor(sec.x);
+        const secY = Math.floor(sec.y);
+        const secW = Math.floor(sec.w);
+        const secH = Math.floor(sec.h);
+
+        const rawProfile = new Float32Array(secH);
+        for (let y = 0; y < secH; y++) {
+          let rowCount = 0;
+          const rOffset = (secY + y) * w;
+          for (let x = 0; x < secW; x++) {
+            if (mask[rOffset + (secX + x)]) rowCount++;
+          }
+          rawProfile[y] = rowCount;
+        }
+
+        // Two passes of 1D smoothing to neutralize halo edges and faint gradients
+        const yProfile = smoothProfile(smoothProfile(rawProfile));
+        const minRowFill = Math.max(2, secW * 0.2);
+
+        // Candidate peak extraction
+        const candidates = [];
+        for (let y = 0; y < secH; y++) {
+          if (yProfile[y] < minRowFill) continue;
+
+          const prev = y > 0 ? yProfile[y - 1] : 0;
+          const next = y < secH - 1 ? yProfile[y + 1] : 0;
+
+          if (yProfile[y] >= prev && yProfile[y] >= next) {
+            candidates.push({ y, score: yProfile[y] });
+          }
+        }
+
+        // Non-Maximum Suppression (NMS): suppress faint side-peaks within minGap distance
+        const detectedY = [];
+        // Sort descending by intensity so the true line core takes priority over faint edges
+        candidates.sort((a, b) => b.score - a.score);
+
+        for (const cand of candidates) {
+          const conflicts = detectedY.some(d => Math.abs(d - cand.y) <= minGap);
+          if (!conflicts) {
+            detectedY.push(cand.y);
+          }
+        }
+
+        // Restore geometric top-to-bottom order for numbering
+        detectedY.sort((a, b) => a - b);
+
+        const count = detectedY.length;
+        const midX = secX + (secW / 2);
+
+        detectedY.forEach((y, i) => {
+          const globalY = secY + y;
+          const num = i + 1;
+
+          ctx.fillStyle = '#ff1133';
+          ctx.font = 'bold 9px sans-serif';
+          const textWidth = ctx.measureText(num).width;
+          ctx.fillText(num, Math.max(2, midX - 6 - textWidth), globalY + 3);
+
+          ctx.fillRect(midX - 3, globalY, 6, 2);
+        });
+
+        grandTotal += count;
+
+        const countItem = document.createElement('div');
+        countItem.style.margin = '4px 0';
+        countItem.style.fontSize = '12px';
+        countItem.innerHTML = `<strong style="color: #00e5ff;">Bay ${idx + 1}:</strong> ${count} lines`;
+        sectionCountsDisplay.appendChild(countItem);
+      });
+
+      totalCount.textContent = `Total: ${grandTotal} lines (${sections.length} sections)`;
+    }
+  </script>
+</body>
+</html>
